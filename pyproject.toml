@@ -1,0 +1,21 @@
+[project]
+name = "equality-constrained-ddp"
+version = "0.1.0"
+description = "A reimplementation of EC-DDP for trajectory optimization with equality constraints, based on the Augmented Lagrangian approach proposed by El Kazdadi et al. (ICRA 2021). "
+readme = "README.md"
+authors = [{ name = "Jose Manuel", email = "josedlv936@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = ["casadi>=3.6.7", "matplotlib>=3.10.1"]
+
+[project.scripts]
+equality-constrained-ddp = "equality_constrained_ddp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["ruff>=0.9.9"]
+
+[tool.ruff.lint]
+ignore = ["E741"]
