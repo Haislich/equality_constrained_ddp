@@ -19,6 +19,10 @@ class BoundConstrainedLagrangian:
         time_horizon: int = 100,
         integration_timestep: float = 0.01,
         model: BaseSystem = CartPendulum(),
+        *,
+        Q_weight: float = 1,
+        R_weight: float = 0.1,
+        Q_terminal_weight: float = 0.1,
     ) -> None:
         self.alpha = alpha
         self.eta = eta_zero
@@ -35,9 +39,11 @@ class BoundConstrainedLagrangian:
         opt = cs.Opti()
         self.X: cs.MX = opt.variable(self.n)  # symbolic state vector
         self.U: cs.MX = opt.variable(self.m)
-        self.Q: NDArray[np.float32] = np.eye(self.n, dtype=np.float32)
-        self.R: NDArray[np.float32] = np.eye(self.m, dtype=np.float32) * 0.01
-        self.Q_terminal: NDArray[np.float32] = np.eye(self.n, dtype=np.float32) * 0
+        self.Q: NDArray[np.float32] = np.eye(self.n, dtype=np.float32) * Q_weight
+        self.R: NDArray[np.float32] = np.eye(self.m, dtype=np.float32) * R_weight
+        self.Q_terminal: NDArray[np.float32] = (
+            np.eye(self.n, dtype=np.float32) * Q_terminal_weight
+        )
         # TODO: This should be embedded inside the models.
         if self.model.name == "cart_pendulum":
             self.x_target = np.array(
@@ -53,9 +59,97 @@ class BoundConstrainedLagrangian:
         self.h_dim = self.model.constraints(self.X, self.U).shape[0]
         self.LAMBDA: cs.MX = cs.MX.sym("lambda", self.h_dim)  # type: ignore
         self.MU: cs.MX = cs.MX.sym("mu", 1)  # type: ignore
-        self.J: cs.Function = cs.Function(
-            "J", [self.X, self.U], [self.cost(self.X, self.U)], {"post_expand": True}
+        # region: Symbolic definition of the running cost
+        self.L: cs.Function = cs.Function(
+            "L",
+            [self.X, self.U],
+            [self.running_cost(self.X, self.U)],
+            {"post_expand": True},
         )
+        self.Lx: cs.Function = cs.Function(
+            "Lx",
+            [self.X, self.U],
+            [cs.jacobian(self.running_cost(self.X, self.U), self.X)],
+            {"post_expand": True},
+        )
+        self.Lu: cs.Function = cs.Function(
+            "Lu",
+            [self.X, self.U],
+            [cs.jacobian(self.running_cost(self.X, self.U), self.U)],
+            {"post_expand": True},
+        )
+        self.Lxx: cs.Function = cs.Function(
+            "Lxx",
+            [self.X, self.U],
+            [
+                cs.jacobian(
+                    cs.jacobian(
+                        self.running_cost(self.X, self.U),
+                        self.X,
+                    ),
+                    self.X,
+                )
+            ],
+            {"post_expand": True},
+        )
+        self.Luu: cs.Function = cs.Function(
+            "Luu",
+            [self.X, self.U],
+            [
+                cs.jacobian(
+                    cs.jacobian(
+                        self.running_cost(self.X, self.U),
+                        self.U,
+                    ),
+                    self.U,
+                )
+            ],
+            {"post_expand": True},
+        )
+        self.Lux: cs.Function = cs.Function(
+            "Lux",
+            [self.X, self.U],
+            [
+                cs.jacobian(
+                    cs.jacobian(
+                        self.running_cost(self.X, self.U),
+                        self.U,
+                    ),
+                    self.X,
+                )
+            ],
+            {"post_expand": True},
+        )
+        # endregion
+        # region: Symbolic definition of the terminal cost
+        self.L_terminal: cs.Function = cs.Function(
+            "L_terminal",
+            [self.X],
+            [self.terminal_cost(self.X)],
+            {"post_expand": True},
+        )
+        self.Lx_terminal: cs.Function = cs.Function(
+            "Lx_terminal",
+            [self.X],
+            [cs.jacobian(self.terminal_cost(self.X), self.X)],
+            {"post_expand": True},
+        )
+        self.Lxx_terminal: cs.Function = cs.Function(
+            "Lxx_terminal",
+            [self.X],
+            [
+                cs.jacobian(
+                    cs.jacobian(
+                        self.terminal_cost(self.X),
+                        self.X,
+                    ),
+                    self.X,
+                )
+            ],
+            {"post_expand": True},
+        )
+        # endregion
+        # Symbolic definition of the Augemented lagrangian cost
         self.L_mu: cs.Function = cs.Function(
             "L_mu",
             [self.X, self.U, self.LAMBDA, self.MU],
@@ -140,27 +234,36 @@ class BoundConstrainedLagrangian:
         mu: float,
     ):
         x_N = x[:, self.time_horizon]
-        u_N = u[:, self.time_horizon - 1]
 
-        self.V[self.time_horizon] = (
-            self.L_mu.call((x_N, u_N, lam, mu))[0].full().squeeze()
-        )
-        self.Vx[:, self.time_horizon] = (
-            self.Lx_mu.call((x_N, u_N, lam, mu))[0].full().squeeze()
-        )
+        self.V[self.time_horizon] = self.L_terminal.call((x_N,))[0].full().squeeze()
+        self.Vx[:, self.time_horizon] = self.L_terminal.call((x_N,))[0].full().squeeze()
         self.Vxx[:, :, self.time_horizon] = (
-            self.Lxx_mu.call((x_N, u_N, lam, mu))[0].full().squeeze()
+            self.L_terminal.call((x_N,))[0].full().squeeze()
         )
         for i in reversed(range(self.time_horizon)):
             x_i = x[:, i]
             u_i = u[:, i]
 
-            fx_i = self.Fx.call((x_i, u_i))
-            fu_i = self.Fx.call((x_i, u_i))
+            fx_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
+            fu_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
+
+            Qxx: NDArray = (
+                self.Lxx.call((x_i, u_i)) + fx_i.T @ self.Vxx[:, :, i + 1] @ fx_i
+            )
+            Qux: NDArray = (
+                self.Lux.call((x_i, u_i)) + fu_i.T @ self.Vxx[:, :, i + 1] @ fx_i
+            )
+            Quu = self.Luu.call((x_i, u_i)) + fu_i.T @ self.Vxx[:, :, i + 1] @ fu_i
+            Qx = self.Lx.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fx_i
+            Qu = self.Lx.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fx_i
+
+            q = self.L.call((x_i, u_i)) + self.V[i + 1]
+
+            exit()
 
     def forward_pass(self): ...
 
-    def solver(self):
+    def solve(self):
         # Initialize the trajectories as described in Eq 1, remembering that we have
         # One less input w.r.t the state
         x = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
@@ -177,4 +280,4 @@ class BoundConstrainedLagrangian:
             self.backward_pass(x, u, lam, mu)
 
 
-BoundConstrainedLagrangian(time_horizon=3).solver()
+BoundConstrainedLagrangian(time_horizon=3).solve()
