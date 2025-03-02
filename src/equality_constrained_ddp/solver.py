@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import List, Tuple
 
 import casadi as cs
 import numpy as np
@@ -199,8 +199,12 @@ class BoundConstrainedLagrangian:
         self.Vx = np.zeros((self.n, self.time_horizon + 1))
         self.Vxx = np.zeros((self.n, self.n, self.time_horizon + 1))
 
-        self.k = [np.zeros((self.m, 1)) for _ in range(self.time_horizon)]
-        self.K = [np.zeros((self.m, self.n)) for _ in range(self.time_horizon)]
+        self.k: List[NDArray] = [
+            np.zeros([self.m, 1]) for _ in range(self.time_horizon)
+        ]
+        self.K: List[NDArray] = [
+            np.zeros([self.m, self.n]) for _ in range(self.time_horizon)
+        ]
 
     def running_cost(self, X: cs.MX, U: cs.MX):
         return (self.x_target - X).T @ self.Q @ (self.x_target - X) + U.T @ self.R @ U
@@ -230,36 +234,52 @@ class BoundConstrainedLagrangian:
         self,
         x: NDArray[np.float32],
         u: NDArray[np.float32],
-        lam: NDArray[np.float32],
-        mu: float,
     ):
         x_N = x[:, self.time_horizon]
 
         self.V[self.time_horizon] = self.L_terminal.call((x_N,))[0].full().squeeze()
-        self.Vx[:, self.time_horizon] = self.L_terminal.call((x_N,))[0].full().squeeze()
-        self.Vxx[:, :, self.time_horizon] = (
-            self.L_terminal.call((x_N,))[0].full().squeeze()
+        self.Vx[:, self.time_horizon] = (
+            self.Lx_terminal.call((x_N,))[0].full().squeeze()
         )
+        self.Vxx[:, :, self.time_horizon] = (
+            self.Lxx_terminal.call((x_N,))[0].full().squeeze()
+        )
+        print(self.n, self.K[self.time_horizon - 1].shape)
         for i in reversed(range(self.time_horizon)):
             x_i = x[:, i]
             u_i = u[:, i]
 
             fx_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
-            fu_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
+            fu_i: NDArray = self.Fu.call((x_i, u_i))[0].full()
 
             Qxx: NDArray = (
                 self.Lxx.call((x_i, u_i)) + fx_i.T @ self.Vxx[:, :, i + 1] @ fx_i
-            )
+            ).reshape((self.n, self.n))
             Qux: NDArray = (
                 self.Lux.call((x_i, u_i)) + fu_i.T @ self.Vxx[:, :, i + 1] @ fx_i
-            )
-            Quu = self.Luu.call((x_i, u_i)) + fu_i.T @ self.Vxx[:, :, i + 1] @ fu_i
-            Qx = self.Lx.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fx_i
-            Qu = self.Lx.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fx_i
+            ).reshape((self.m, self.n))
+            Quu: NDArray = (
+                self.Luu.call((x_i, u_i)) + fu_i.T @ self.Vxx[:, :, i + 1] @ fu_i
+            ).reshape((self.m, self.m))
+            Qx: NDArray = (
+                self.Lx.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fx_i
+            ).reshape((self.n,))
+            Qu: NDArray = (
+                self.Lu.call((x_i, u_i)) + self.Vx[:, i + 1].T @ fu_i
+            ).reshape((self.m,))
 
-            q = self.L.call((x_i, u_i)) + self.V[i + 1]
+            q: float = self.L.call((x_i, u_i)) + self.V[i + 1]
 
-            exit()
+            # Regularize Quu to ensure invertibility
+            Quu_reg = Quu + 1e-5
+            Quu_inv = np.linalg.inv(Quu_reg)
+
+            self.k[i] = -Quu_inv @ Qu
+            self.K[i] = -Quu_inv @ Qux
+
+            self.Vxx[:, :, i] = Qxx - self.K[i].T @ Quu @ self.K[i]
+            self.Vx[:, i] = Qx - self.K[i].T @ Quu @ self.k[i]
+            self.V[i] = q - 0.5 * self.k[i].T @ Quu @ self.k[i]
 
     def forward_pass(self): ...
 
@@ -277,7 +297,7 @@ class BoundConstrainedLagrangian:
             cost += self.L_mu.call((x[:, i], u[:, i], lam, mu))[0].full().squeeze()
 
         while self.eta > self.eta_threshold and self.omega > self.omega_threshold:
-            self.backward_pass(x, u, lam, mu)
+            self.backward_pass(x, u)
 
 
 BoundConstrainedLagrangian(time_horizon=3).solve()
