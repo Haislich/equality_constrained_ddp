@@ -25,9 +25,9 @@ class BoundConstrainedLagrangian:
         Q_terminal_weight: float = 0.1,
     ) -> None:
         self.alpha = alpha
-        self.eta = eta_zero
+        self.eta_zero = eta_zero
         self.eta_threshold = eta_threshold
-        self.omega = omega_zero
+        self.omega_zero = omega_zero
         self.omega_threshold = omega_threshold
         self.max_line_search_iters = max_line_search_iters
         self.time_horizon = time_horizon
@@ -56,8 +56,8 @@ class BoundConstrainedLagrangian:
         else:
             raise ValueError("Unrecognized model type")
 
-        self.h_dim = self.model.constraints(self.X, self.U).shape[0]
-        self.LAMBDA: cs.MX = cs.MX.sym("lambda", self.h_dim)  # type: ignore
+        self.constraints: cs.DM = self.model.constraints(self.X, self.U)
+        self.LAMBDA: cs.MX = cs.MX.sym("lambda", self.constraints.shape[0])  # type: ignore
         self.MU: cs.MX = cs.MX.sym("mu", 1)  # type: ignore
         # region: Symbolic definition of the running cost
         self.L: cs.Function = cs.Function(
@@ -159,7 +159,14 @@ class BoundConstrainedLagrangian:
         self.Lx_mu: cs.Function = cs.Function(
             "Lx_mu",
             [self.X, self.U, self.LAMBDA, self.MU],
-            [cs.jacobian(self.L_mu(self.X, self.U, self.LAMBDA, self.MU), self.X)],
+            [
+                cs.jacobian(
+                    self.augmented_lagrangian_cost(
+                        self.X, self.U, self.LAMBDA, self.MU
+                    ),
+                    self.X,
+                )
+            ],
             {"post_expand": True},
         )
 
@@ -169,7 +176,9 @@ class BoundConstrainedLagrangian:
             [
                 cs.jacobian(
                     cs.jacobian(
-                        self.L_mu(self.X, self.U, self.LAMBDA, self.MU),
+                        self.augmented_lagrangian_cost(
+                            self.X, self.U, self.LAMBDA, self.MU
+                        ),
                         self.X,
                     ),
                     self.X,
@@ -195,6 +204,11 @@ class BoundConstrainedLagrangian:
             [cs.jacobian(self.discrete_dynamics(self.X, self.U), self.U)],
             {"post_expand": True},
         )
+
+        self.H: cs.Function = cs.Function(
+            "H", [self.X, self.U], [self.model.constraints(self.X, self.U)]
+        )
+
         self.V = np.zeros(self.time_horizon + 1)
         self.Vx = np.zeros((self.n, self.time_horizon + 1))
         self.Vxx = np.zeros((self.n, self.n, self.time_horizon + 1))
@@ -216,15 +230,10 @@ class BoundConstrainedLagrangian:
         return self.running_cost(X, U) + self.terminal_cost(X)
 
     def augmented_lagrangian_cost(self, X: cs.MX, U: cs.MX, LAMBDA: cs.MX, MU: cs.MX):
-        # Se calcoliamo solo una volta i constraints rimangono fissi
-        # e non cambiano al cambiare delle variabili simboliche, in teoria va fatto
-        # perche constraints e' una DM non una MX
-
-        constraints = self.model.constraints(X, U)
         return (
             self.cost(X, U)
-            + cs.dot(LAMBDA.T, constraints)
-            + MU * 0.5 * cs.sumsqr(constraints)
+            + cs.dot(LAMBDA.T, self.constraints)
+            + MU * 0.5 * cs.sumsqr(self.constraints)
         )
 
     def discrete_dynamics(self, X: cs.MX, U: cs.MX):
@@ -244,7 +253,7 @@ class BoundConstrainedLagrangian:
         self.Vxx[:, :, self.time_horizon] = (
             self.Lxx_terminal.call((x_N,))[0].full().squeeze()
         )
-        print(self.n, self.K[self.time_horizon - 1].shape)
+
         for i in reversed(range(self.time_horizon)):
             x_i = x[:, i]
             u_i = u[:, i]
@@ -279,25 +288,88 @@ class BoundConstrainedLagrangian:
 
             self.Vxx[:, :, i] = Qxx - self.K[i].T @ Quu @ self.K[i]
             self.Vx[:, i] = Qx - self.K[i].T @ Quu @ self.k[i]
-            self.V[i] = q - 0.5 * self.k[i].T @ Quu @ self.k[i]
 
-    def forward_pass(self): ...
+            self.V[i] = (q - 0.5 * (self.k[i].T @ Quu @ self.k[i])).item()
+
+    def forward_pass(
+        self, x: NDArray, u: NDArray, alpha: float
+    ) -> Tuple[NDArray, NDArray]:
+        x_new = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
+        u_new = np.ones([self.m, self.time_horizon], dtype=np.float32)
+        # Set the initial condition
+        x_new[:, 0] = x[:, 0]
+
+        for i in range(self.time_horizon):
+            # Apply updated control policy
+            u_new[:, i] = (
+                u[:, i] + alpha * self.k[i] + self.K[i] @ (x_new[:, i] - x[:, i])
+            )
+
+            # Integrate system dynamics (e.g., Euler method)
+            x_new[:, i + 1] = (
+                self.F.call((x_new[:, i], u_new[:, i]))[0].full().reshape((self.n,))
+            )
+
+        return x_new, u_new
 
     def solve(self):
         # Initialize the trajectories as described in Eq 1, remembering that we have
         # One less input w.r.t the state
         x = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u = np.ones([self.m, self.time_horizon], dtype=np.float32)
-        lam = np.zeros([self.h_dim], dtype=np.float32)
+        lam = np.zeros([self.constraints.shape[0]], dtype=np.float32)
         mu = 1.1
+        eta = self.eta_zero
+        omega = self.omega_zero
+        k = 3
+        alpha = 1.0
 
+        # We get an initial guess about where we are currently cost-wise
         cost = 0
         for i in range(self.time_horizon):
-            x[:, i + 1] = self.F.call((x[:, i], u[:, i]))[0].full().squeeze()
-            cost += self.L_mu.call((x[:, i], u[:, i], lam, mu))[0].full().squeeze()
-
-        while self.eta > self.eta_threshold and self.omega > self.omega_threshold:
+            x[:, i + 1] = self.F.call((x[:, i], u[:, i]))[0].full().reshape((self.n,))
+            cost += self.L_mu.call((x[:, i], u[:, i], lam, mu))[0].full().item()
+        # Then we try to improve with what we know
+        while eta > self.eta_threshold and omega > self.omega_threshold:
+            # Compute the gains and value function updates
             self.backward_pass(x, u)
+            t = 1.0
+            beta = 0.5
+            new_cost = float("inf")
+            x_new = x.copy()
+            u_new = u.copy()
+            for _ in range(self.max_line_search_iters):
+                new_cost = 0
+                x_new, u_new = self.forward_pass(x, u, t)
+                for i in range(self.time_horizon):
+                    new_cost += (
+                        self.L_mu.call((x_new[:, i], u_new[:, i], lam, mu))[0]
+                        .full()
+                        .squeeze()
+                    )
+                # If cost improves, accept step
+                if new_cost < cost:
+                    break
+                else:
+                    t *= beta
+            x = x_new
+            u = u_new
+            norm = max(
+                [
+                    np.linalg.norm(
+                        self.Lx_mu.call((x[:, i], u[:, i], lam, mu))[0].full()
+                    )
+                    for i in range(self.time_horizon)
+                ]  # type: ignore
+            )
+            if norm < omega:
+                c = self.H.call((x, u))[0].full()
+                if cs.sumsqr(c) < eta:
+                    lam += mu * c
+                    eta /= np.pow(mu, alpha)
+                    omega /= mu
+                else:
+                    mu *= k
 
 
 BoundConstrainedLagrangian(time_horizon=3).solve()
