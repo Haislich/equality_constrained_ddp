@@ -41,26 +41,24 @@ class BoundConstrainedLagrangian:
         opt = cs.Opti()
         self.X: cs.MX = opt.variable(self.n)  # symbolic state vector
         self.U: cs.MX = opt.variable(self.m)
+        self.LAMBDA: cs.MX = opt.parameter(self.n)
+        self.MU: cs.MX = opt.parameter(1)
         self.Q: NDArray[np.float32] = np.eye(self.n, dtype=np.float32) * Q_weight
         self.R: NDArray[np.float32] = np.eye(self.m, dtype=np.float32) * R_weight
         self.Q_terminal: NDArray[np.float32] = (
             np.eye(self.n, dtype=np.float32) * Q_terminal_weight
         )
-        # TODO: This should be embedded inside the models.
         if self.model.name == "cart_pendulum":
-            self.x_target = np.array(
+            self.x_target = cs.DM(
                 [0, cs.pi, 0, 0]
             )  # upright position for cart-pendulum
         elif self.model.name == "pendubot":
-            self.x_target = np.array([cs.pi, 0, 0, 0])
+            self.x_target = cs.DM([cs.pi, 0, 0, 0])
         elif self.model.name == "uav":
-            self.x_target = np.array([1, 1, 0, 0, 0, 0])
+            self.x_target = cs.DM([1, 1, 0, 0, 0, 0])
         else:
             raise ValueError("Unrecognized model type")
 
-        self.constraints: cs.DM = self.model.constraints(self.X, self.U)
-        self.LAMBDA: cs.MX = cs.MX.sym("lambda", self.constraints.shape[0])  # type: ignore
-        self.MU: cs.MX = cs.MX.sym("mu", 1)  # type: ignore
         # region: Symbolic definition of the running cost
         self.L: cs.Function = cs.Function(
             "L",
@@ -207,9 +205,7 @@ class BoundConstrainedLagrangian:
             {"post_expand": True},
         )
 
-        self.H: cs.Function = cs.Function(
-            "H", [self.X, self.U], [self.model.constraints(self.X, self.U)]
-        )
+        self.H: cs.Function = cs.Function("H", [self.X], [self.constraint(self.X)])
 
         self.V = np.zeros(self.time_horizon + 1)
         self.Vx = np.zeros((self.n, self.time_horizon + 1))
@@ -234,12 +230,15 @@ class BoundConstrainedLagrangian:
     def augmented_lagrangian_cost(self, X: cs.MX, U: cs.MX, LAMBDA: cs.MX, MU: cs.MX):
         return (
             self.cost(X, U)
-            + cs.dot(LAMBDA.T, self.constraints)
-            + MU * 0.5 * cs.sumsqr(self.constraints)
+            + (LAMBDA.T @ self.constraint(X))
+            + MU * 0.5 * cs.sumsqr(self.constraint(X))
         )
 
     def discrete_dynamics(self, X: cs.MX, U: cs.MX):
         return X + self.integration_timestep * self.model.f(X, U)
+
+    def constraint(self, X):
+        return X - self.x_target
 
     def backward_pass(
         self,
@@ -257,7 +256,7 @@ class BoundConstrainedLagrangian:
         )
 
         for i in reversed(range(self.time_horizon)):
-            x_i = x[:, i + 1]
+            x_i = x[:, i]
             u_i = u[:, i]
 
             fx_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
@@ -282,28 +281,20 @@ class BoundConstrainedLagrangian:
             q: float = self.L.call((x_i, u_i)) + self.V[i + 1]
 
             # Regularize Quu to ensure invertibility
-            Quu_reg = Quu + 1e-5
-            Quu_inv = np.linalg.inv(Quu_reg)
+            # Quu_reg = Quu + 1e-5
+            Quu_inv = np.linalg.inv(Quu)
 
             self.k[i] = -Quu_inv @ Qu
             self.K[i] = -Quu_inv @ Qux
 
             self.Vxx[:, :, i] = Qxx - self.K[i].T @ Quu @ self.K[i]
             self.Vx[:, i] = Qx - self.K[i].T @ Quu @ self.k[i]
-
             self.V[i] = (q - 0.5 * (self.k[i].T @ Quu @ self.k[i])).item()
-            # print("\t\t", end="")
-            # print(
-            #     f"k[{i:3d}] = {self.k[i][0]} | "
-            #     f"K[{i:3d}] = {self.K[i][0]} | "
-            #     f"Vxx[{i:3d}] = {self.Vxx[:, :, i].shape} | "
-            #     f"Vx[{i:3d}] = {self.Vx[:, i].shape} | "
-            #     f"V[{i:3d}] = {self.V[i]} | "
-            # )
 
     def forward_pass(
         self, x: NDArray[np.float32], u: NDArray[np.float32], lam, mu, alpha: float
     ) -> Tuple[NDArray[np.float32], NDArray[np.float32], float]:
+        # lam = 0
         x_new = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u_new = np.ones([self.m, self.time_horizon], dtype=np.float32)
         # Set the initial condition
@@ -312,6 +303,7 @@ class BoundConstrainedLagrangian:
 
         for i in range(self.time_horizon):
             # Apply updated control policy
+            # print(u[:, i], alpha * self.k[i], self.K[i], x[:, i], x_new[:, i])
             u_new[:, i] = (
                 u[:, i] + alpha * self.k[i] + self.K[i] @ (x_new[:, i] - x[:, i])
             )
@@ -321,7 +313,7 @@ class BoundConstrainedLagrangian:
                 self.F.call((x_new[:, i], u_new[:, i]))[0].full().reshape((self.n,))
             )
             new_cost += (
-                self.L_mu.call((x_new[:, i + 1], u_new[:, i], 0, mu))[0]
+                self.L_mu.call((x_new[:, i + 1], u_new[:, i], lam, mu))[0]
                 .full()
                 .squeeze()
             )
@@ -333,11 +325,11 @@ class BoundConstrainedLagrangian:
         # One less input w.r.t the state
         x = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u = np.ones([self.m, self.time_horizon], dtype=np.float32)
-        lam = np.zeros([self.constraints.shape[0]], dtype=np.float32)
-        mu = 100
+        lam = np.zeros([self.n], dtype=np.float32)
+        mu = 1.1
         eta = self.eta_zero
         omega = self.omega_zero
-        k = 3
+        k = 10
         alpha = 1.0
 
         # We get an initial guess about where we are currently cost-wise
@@ -362,6 +354,7 @@ class BoundConstrainedLagrangian:
                 # If cost improves, accept step
                 if new_cost < cost:
                     cost = new_cost
+                    break
                 else:
                     alpha *= beta
 
@@ -375,20 +368,21 @@ class BoundConstrainedLagrangian:
             )
 
             L_norm = np.linalg.norm(L_norms, np.inf)
+            c = self.H.call((x[:, self.time_horizon],))[0].full().reshape((self.n,))
+            # print(c)
             c_norm = np.linalg.norm(
-                self.H.call((x[:, self.time_horizon], u[:, self.time_horizon - 1]))[
-                    0
-                ].full(),
+                c,
                 np.inf,
             )
             if L_norm < omega:
                 if c_norm < eta:
-                    lam += c_norm
+                    lam += c * mu
                     eta /= np.pow(mu, alpha)
                     omega /= mu
 
                 else:
                     mu *= k
+
             print(
                 f"Iteration: {iteration:5d} | "
                 f"L_norm:{L_norm:.4f} | "
@@ -398,11 +392,9 @@ class BoundConstrainedLagrangian:
                 f"lambda: {lam.tolist()} | "
                 f"|| h ||: {c_norm} | "
                 f"Alpha: {alpha:.5f} | "
-                f"New cost: {new_cost} | "
-                f"cost: {cost} | "
             )
 
 
 BoundConstrainedLagrangian(
-    time_horizon=100, eta_zero=20, omega_zero=20, max_line_search_iters=20
+    time_horizon=100, eta_zero=10, omega_zero=15, max_line_search_iters=10
 ).solve()
