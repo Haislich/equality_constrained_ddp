@@ -6,6 +6,8 @@ from numpy.typing import NDArray
 
 from equality_constrained_ddp.model import BaseSystem, CartPendulum
 
+np.set_printoptions(precision=5)
+
 
 class BoundConstrainedLagrangian:
     def __init__(
@@ -22,7 +24,7 @@ class BoundConstrainedLagrangian:
         *,
         Q_weight: float = 1,
         R_weight: float = 0.1,
-        Q_terminal_weight: float = 0.1,
+        Q_terminal_weight: float = 10000,
     ) -> None:
         self.alpha = alpha
         self.eta_zero = eta_zero
@@ -255,7 +257,7 @@ class BoundConstrainedLagrangian:
         )
 
         for i in reversed(range(self.time_horizon)):
-            x_i = x[:, i]
+            x_i = x[:, i + 1]
             u_i = u[:, i]
 
             fx_i: NDArray = self.Fx.call((x_i, u_i))[0].full()
@@ -290,10 +292,18 @@ class BoundConstrainedLagrangian:
             self.Vx[:, i] = Qx - self.K[i].T @ Quu @ self.k[i]
 
             self.V[i] = (q - 0.5 * (self.k[i].T @ Quu @ self.k[i])).item()
+            # print("\t\t", end="")
+            # print(
+            #     f"k[{i:3d}] = {self.k[i][0]} | "
+            #     f"K[{i:3d}] = {self.K[i][0]} | "
+            #     f"Vxx[{i:3d}] = {self.Vxx[:, :, i].shape} | "
+            #     f"Vx[{i:3d}] = {self.Vx[:, i].shape} | "
+            #     f"V[{i:3d}] = {self.V[i]} | "
+            # )
 
     def forward_pass(
-        self, x: NDArray, u: NDArray, alpha: float
-    ) -> Tuple[NDArray, NDArray]:
+        self, x: NDArray[np.float32], u: NDArray[np.float32], alpha: float
+    ) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
         x_new = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u_new = np.ones([self.m, self.time_horizon], dtype=np.float32)
         # Set the initial condition
@@ -309,7 +319,6 @@ class BoundConstrainedLagrangian:
             x_new[:, i + 1] = (
                 self.F.call((x_new[:, i], u_new[:, i]))[0].full().reshape((self.n,))
             )
-
         return x_new, u_new
 
     def solve(self):
@@ -328,19 +337,21 @@ class BoundConstrainedLagrangian:
         cost = 0
         for i in range(self.time_horizon):
             x[:, i + 1] = self.F.call((x[:, i], u[:, i]))[0].full().reshape((self.n,))
-            cost += self.L_mu.call((x[:, i], u[:, i], lam, mu))[0].full().item()
+            cost += self.L_mu.call((x[:, i + 1], u[:, i], lam, mu))[0].full().item()
+        iteration = 0
         # Then we try to improve with what we know
         while eta > self.eta_threshold and omega > self.omega_threshold:
+            iteration += 1
             # Compute the gains and value function updates
             self.backward_pass(x, u)
-            t = 1.0
+            alpha = self.alpha
             beta = 0.5
             new_cost = float("inf")
             x_new = x.copy()
             u_new = u.copy()
             for _ in range(self.max_line_search_iters):
                 new_cost = 0
-                x_new, u_new = self.forward_pass(x, u, t)
+                x_new, u_new = self.forward_pass(x, u, alpha)
                 for i in range(self.time_horizon):
                     new_cost += (
                         self.L_mu.call((x_new[:, i], u_new[:, i], lam, mu))[0]
@@ -349,27 +360,56 @@ class BoundConstrainedLagrangian:
                     )
                 # If cost improves, accept step
                 if new_cost < cost:
+                    cost = new_cost
                     break
                 else:
-                    t *= beta
+                    alpha *= beta
+
             x = x_new
             u = u_new
-            norm = max(
+            L_norms = np.array(
                 [
-                    np.linalg.norm(
-                        self.Lx_mu.call((x[:, i], u[:, i], lam, mu))[0].full()
-                    )
+                    self.Lx_mu.call((x[:, i + 1], u[:, i], lam, mu))[0].full().squeeze()
                     for i in range(self.time_horizon)
-                ]  # type: ignore
+                ]
             )
-            if norm < omega:
-                c = self.H.call((x, u))[0].full()
-                if cs.sumsqr(c) < eta:
-                    lam += mu * c
+            L_norm = np.linalg.norm(L_norms, np.inf)
+            if L_norm < omega:
+                # norm_c = #self.H.call((x, u))[0].full()
+                c_norm = max(
+                    [
+                        np.linalg.norm(
+                            self.Lx_mu.call((x[:, i + 1], u[:, i], lam, mu))[0].full()
+                        )
+                        for i in range(self.time_horizon)
+                    ]  # type: ignore
+                )
+                if c_norm < eta:
+                    lam += (
+                        mu
+                        * self.H.call(
+                            (
+                                x[:, self.time_horizon],
+                                u[: self.time_horizon - 1],
+                            )
+                        )[0].full()
+                    )  # c_max
                     eta /= np.pow(mu, alpha)
                     omega /= mu
+
                 else:
                     mu *= k
+            print(
+                f"Iteration: {iteration:5d} | "
+                f"L_norm:{L_norm:.4f} | "
+                f"eta: {eta:.4f} | "
+                f"omega: {omega:.4f} | "
+                f"mu: {mu:.4f} | "
+                f"lambda: {lam.tolist()} | "
+                f"Alpha: {alpha:.5f} | "
+                f"New cost: {new_cost} | "
+                f"cost: {cost} | "
+            )
 
 
-BoundConstrainedLagrangian(time_horizon=3).solve()
+BoundConstrainedLagrangian(time_horizon=100).solve()
