@@ -24,7 +24,7 @@ class BoundConstrainedLagrangian:
         *,
         Q_weight: float = 1,
         R_weight: float = 0.1,
-        Q_terminal_weight: float = 10000,
+        Q_terminal_weight: float = 0,
     ) -> None:
         self.alpha = alpha
         self.eta_zero = eta_zero
@@ -302,12 +302,13 @@ class BoundConstrainedLagrangian:
             # )
 
     def forward_pass(
-        self, x: NDArray[np.float32], u: NDArray[np.float32], alpha: float
-    ) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
+        self, x: NDArray[np.float32], u: NDArray[np.float32], lam, mu, alpha: float
+    ) -> Tuple[NDArray[np.float32], NDArray[np.float32], float]:
         x_new = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u_new = np.ones([self.m, self.time_horizon], dtype=np.float32)
         # Set the initial condition
         x_new[:, 0] = x[:, 0]
+        new_cost = 0.0
 
         for i in range(self.time_horizon):
             # Apply updated control policy
@@ -319,7 +320,13 @@ class BoundConstrainedLagrangian:
             x_new[:, i + 1] = (
                 self.F.call((x_new[:, i], u_new[:, i]))[0].full().reshape((self.n,))
             )
-        return x_new, u_new
+            new_cost += (
+                self.L_mu.call((x_new[:, i + 1], u_new[:, i], 0, mu))[0]
+                .full()
+                .squeeze()
+            )
+
+        return x_new, u_new, new_cost
 
     def solve(self):
         # Initialize the trajectories as described in Eq 1, remembering that we have
@@ -327,7 +334,7 @@ class BoundConstrainedLagrangian:
         x = np.zeros([self.n, self.time_horizon + 1], dtype=np.float32)
         u = np.ones([self.m, self.time_horizon], dtype=np.float32)
         lam = np.zeros([self.constraints.shape[0]], dtype=np.float32)
-        mu = 1.1
+        mu = 100
         eta = self.eta_zero
         omega = self.omega_zero
         k = 3
@@ -351,17 +358,10 @@ class BoundConstrainedLagrangian:
             u_new = u.copy()
             for _ in range(self.max_line_search_iters):
                 new_cost = 0
-                x_new, u_new = self.forward_pass(x, u, alpha)
-                for i in range(self.time_horizon):
-                    new_cost += (
-                        self.L_mu.call((x_new[:, i], u_new[:, i], lam, mu))[0]
-                        .full()
-                        .squeeze()
-                    )
+                x_new, u_new, new_cost = self.forward_pass(x, u, lam, mu, alpha)
                 # If cost improves, accept step
                 if new_cost < cost:
                     cost = new_cost
-                    break
                 else:
                     alpha *= beta
 
@@ -373,27 +373,17 @@ class BoundConstrainedLagrangian:
                     for i in range(self.time_horizon)
                 ]
             )
+
             L_norm = np.linalg.norm(L_norms, np.inf)
+            c_norm = np.linalg.norm(
+                self.H.call((x[:, self.time_horizon], u[:, self.time_horizon - 1]))[
+                    0
+                ].full(),
+                np.inf,
+            )
             if L_norm < omega:
-                # norm_c = #self.H.call((x, u))[0].full()
-                c_norm = max(
-                    [
-                        np.linalg.norm(
-                            self.Lx_mu.call((x[:, i + 1], u[:, i], lam, mu))[0].full()
-                        )
-                        for i in range(self.time_horizon)
-                    ]  # type: ignore
-                )
                 if c_norm < eta:
-                    lam += (
-                        mu
-                        * self.H.call(
-                            (
-                                x[:, self.time_horizon],
-                                u[: self.time_horizon - 1],
-                            )
-                        )[0].full()
-                    )  # c_max
+                    lam += c_norm
                     eta /= np.pow(mu, alpha)
                     omega /= mu
 
@@ -406,10 +396,13 @@ class BoundConstrainedLagrangian:
                 f"omega: {omega:.4f} | "
                 f"mu: {mu:.4f} | "
                 f"lambda: {lam.tolist()} | "
+                f"|| h ||: {c_norm} | "
                 f"Alpha: {alpha:.5f} | "
                 f"New cost: {new_cost} | "
                 f"cost: {cost} | "
             )
 
 
-BoundConstrainedLagrangian(time_horizon=100).solve()
+BoundConstrainedLagrangian(
+    time_horizon=100, eta_zero=20, omega_zero=20, max_line_search_iters=20
+).solve()
